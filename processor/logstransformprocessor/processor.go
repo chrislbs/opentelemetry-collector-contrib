@@ -21,6 +21,7 @@ import (
 	"math"
 	"runtime"
 	"sync"
+	"time"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/extension/experimental/storage"
@@ -120,10 +121,7 @@ func (ltp *logsTransformProcessor) Start(ctx context.Context, host component.Hos
 
 func (ltp *logsTransformProcessor) processLogs(ctx context.Context, ld plog.Logs) (plog.Logs, error) {
 	// Add the logs to the chain
-	err := ltp.fromConverter.Batch(ld)
-	if err != nil {
-		return ld, err
-	}
+	go ltp.fromConverter.Batch(ld)
 
 	doneChan := ctx.Done()
 	for {
@@ -131,12 +129,14 @@ func (ltp *logsTransformProcessor) processLogs(ctx context.Context, ld plog.Logs
 		case <-doneChan:
 			ltp.logger.Debug("loop stopped")
 			return ld, errors.New("processor interrupted")
+		case <-time.After(150 * time.Millisecond):
+			return plog.NewLogs(), nil
 		case output, ok := <-ltp.outputChannel:
 			if !ok {
 				return ld, errors.New("processor encountered an issue receiving logs from stanza operators pipeline")
 			}
 			if output.err != nil {
-				return ld, err
+				return ld, output.err
 			}
 
 			return output.logs, nil

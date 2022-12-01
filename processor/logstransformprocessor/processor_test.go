@@ -16,6 +16,9 @@ package logstransformprocessor
 
 import (
 	"context"
+	"fmt"
+	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -79,9 +82,104 @@ type testLogMessage struct {
 	attributes   *map[string]pcommon.Value
 }
 
+type testLogMessagePair struct {
+	actual   testLogMessage
+	expected testLogMessage
+}
+
+func generateMessage(messageId int) testLogMessagePair {
+	baseMessage := pcommon.NewValueStr(fmt.Sprintf("2022-01-01 01:02:03 INFO this is test message %d", messageId))
+	spanID := pcommon.SpanID([8]byte{0x32, 0xf0, 0xa2, 0x2b, 0x6a, 0x81, 0x2c, 0xff})
+	traceID := pcommon.TraceID([16]byte{0x48, 0x01, 0x40, 0xf3, 0xd7, 0x70, 0xa5, 0xae, 0x32, 0xf0, 0xa2, 0x2b, 0x6a, 0x81, 0x2c, 0xff})
+	infoSeverityText := "Info"
+
+	actual := testLogMessage{
+		body:         baseMessage,
+		spanID:       spanID,
+		traceID:      traceID,
+		flags:        uint32(0x01),
+		observedTime: parseTime("2006-01-02", "2022-01-02"),
+	}
+
+	expected := testLogMessage{
+		body:         baseMessage,
+		severity:     plog.SeverityNumberInfo,
+		severityText: &infoSeverityText,
+		attributes: &map[string]pcommon.Value{
+			"msg":  pcommon.NewValueStr(fmt.Sprintf("this is test message %d", messageId)),
+			"time": pcommon.NewValueStr("2022-01-01 01:02:03"),
+			"sev":  pcommon.NewValueStr("INFO"),
+		},
+		spanID:       spanID,
+		traceID:      traceID,
+		flags:        uint32(0x01),
+		observedTime: parseTime("2006-01-02", "2022-01-02"),
+		time:         parseTime("2006-01-02 15:04:05", "2022-01-01 01:02:03"),
+	}
+
+	return testLogMessagePair{
+		actual:   actual,
+		expected: expected,
+	}
+}
+
+func generateMessages(numMessages int) []testLogMessagePair {
+	testMessages := make([]testLogMessagePair, numMessages)
+	for i := 0; i < numMessages; i++ {
+		testMessages[i] = generateMessage(i)
+	}
+	return testMessages
+}
+
 // Temporary abstraction to avoid "unused" linter
 var skip = func(t *testing.T, why string) {
 	t.Skip(why)
+}
+
+func TestLogsTransformProcessorLoad(t *testing.T) {
+
+	numMessagesPerConsume := 200
+	totalMessages := (runtime.NumCPU() * 100) * numMessagesPerConsume
+
+	testMessages := generateMessages(totalMessages)
+
+	actualMessages := make([][]testLogMessage, totalMessages/numMessagesPerConsume)
+	for i := range actualMessages {
+		actualMessages[i] = make([]testLogMessage, numMessagesPerConsume)
+	}
+	for i := range testMessages {
+		actualMessages[i/numMessagesPerConsume][i%numMessagesPerConsume] = testMessages[i].actual
+	}
+
+	tln := new(consumertest.LogsSink)
+	factory := NewFactory()
+	ltp, err := factory.CreateLogsProcessor(context.Background(), componenttest.NewNopProcessorCreateSettings(), cfg, tln)
+	require.NoError(t, err)
+	assert.True(t, ltp.Capabilities().MutatesData)
+
+	err = ltp.Start(context.Background(), nil)
+	require.NoError(t, err)
+
+	wg := sync.WaitGroup{}
+	for i := range actualMessages {
+		wg.Add(1)
+		logMessages := actualMessages[i]
+		fmt.Printf("%d: Writing %d messages\n", i, len(logMessages))
+		//go func() {
+		err = ltp.ConsumeLogs(context.Background(), generateLogData(logMessages))
+		require.NoError(t, err)
+		wg.Done()
+		//}()
+	}
+	wg.Wait()
+
+	//logs := tln.AllLogs()
+	require.Equal(t, totalMessages, tln.LogRecordCount())
+
+	//for i := 0; i < logs[0].ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().Len(); i++ {
+	//	logs[0].ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(i).Attributes().Sort()
+	//}
+	//assert.EqualValues(t, wantLogData, logs[0])
 }
 
 func TestLogsTransformProcessor(t *testing.T) {
