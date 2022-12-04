@@ -16,6 +16,11 @@ package logstransformprocessor
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"runtime"
+	"runtime/pprof"
+	"sync"
 	"testing"
 	"time"
 
@@ -79,9 +84,171 @@ type testLogMessage struct {
 	attributes   *map[string]pcommon.Value
 }
 
+type testLogMessagePair struct {
+	actual   testLogMessage
+	expected testLogMessage
+}
+
+func generateMessage(messageId int) testLogMessagePair {
+	baseMessage := pcommon.NewValueStr(fmt.Sprintf("2022-01-01 01:02:03 INFO this is test message %d", messageId))
+	spanID := pcommon.SpanID([8]byte{0x32, 0xf0, 0xa2, 0x2b, 0x6a, 0x81, 0x2c, 0xff})
+	traceID := pcommon.TraceID([16]byte{0x48, 0x01, 0x40, 0xf3, 0xd7, 0x70, 0xa5, 0xae, 0x32, 0xf0, 0xa2, 0x2b, 0x6a, 0x81, 0x2c, 0xff})
+	infoSeverityText := "Info"
+
+	actual := testLogMessage{
+		body:         baseMessage,
+		spanID:       spanID,
+		traceID:      traceID,
+		flags:        uint32(0x01),
+		observedTime: parseTime("2006-01-02", "2022-01-02"),
+	}
+
+	expected := testLogMessage{
+		body:         baseMessage,
+		severity:     plog.SeverityNumberInfo,
+		severityText: &infoSeverityText,
+		attributes: &map[string]pcommon.Value{
+			"msg":  pcommon.NewValueStr(fmt.Sprintf("this is test message %d", messageId)),
+			"time": pcommon.NewValueStr("2022-01-01 01:02:03"),
+			"sev":  pcommon.NewValueStr("INFO"),
+		},
+		spanID:       spanID,
+		traceID:      traceID,
+		flags:        uint32(0x01),
+		observedTime: parseTime("2006-01-02", "2022-01-02"),
+		time:         parseTime("2006-01-02 15:04:05", "2022-01-01 01:02:03"),
+	}
+
+	return testLogMessagePair{
+		actual:   actual,
+		expected: expected,
+	}
+}
+
+func generateMessages(numMessages int) []testLogMessagePair {
+	testMessages := make([]testLogMessagePair, numMessages)
+	for i := 0; i < numMessages; i++ {
+		testMessages[i] = generateMessage(i)
+	}
+	return testMessages
+}
+
 // Temporary abstraction to avoid "unused" linter
 var skip = func(t *testing.T, why string) {
 	t.Skip(why)
+}
+
+func waitTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
+	c := make(chan struct{})
+	go func() {
+		defer close(c)
+		wg.Wait()
+	}()
+	select {
+	case <-c:
+		return false
+	case <-time.After(timeout):
+		return true
+	}
+}
+
+func TestLogsTransformProcessor_Deadlock(t *testing.T) {
+	maxEmitterBatchSize := 100
+	numMessagesPerConsume := maxEmitterBatchSize/runtime.NumCPU() - 1
+	totalMessages := runtime.NumCPU() * numMessagesPerConsume
+
+	testMessages := generateMessages(totalMessages)
+
+	actualMessages := make([][]testLogMessage, totalMessages/numMessagesPerConsume)
+	for i := range actualMessages {
+		actualMessages[i] = make([]testLogMessage, numMessagesPerConsume)
+	}
+	for i := range testMessages {
+		actualMessages[i/numMessagesPerConsume][i%numMessagesPerConsume] = testMessages[i].actual
+	}
+
+	tln := new(consumertest.LogsSink)
+	factory := NewFactory()
+	ltp, err := factory.CreateLogsProcessor(context.Background(), componenttest.NewNopProcessorCreateSettings(), cfg, tln)
+	require.NoError(t, err)
+	assert.True(t, ltp.Capabilities().MutatesData)
+
+	err = ltp.Start(context.Background(), nil)
+	require.NoError(t, err)
+
+	wg := sync.WaitGroup{}
+	for i := range actualMessages {
+		wg.Add(1)
+		logMessages := actualMessages[i]
+		fmt.Printf("%d: Writing %d messages\n", i, len(logMessages))
+		go func() {
+			err = ltp.ConsumeLogs(context.Background(), generateLogData(logMessages))
+			require.NoError(t, err)
+			wg.Done()
+		}()
+	}
+	if waitTimeout(&wg, 1*time.Second) {
+		profile := pprof.Lookup("goroutine")
+		profile.WriteTo(os.Stdout, 1)
+		require.True(t, true, "timed out due to deadlock")
+	}
+
+	require.Equal(t, totalMessages, tln.LogRecordCount())
+}
+
+func TestLogsTransformProcessor_BlockedMessages(t *testing.T) {
+	maxEmitterBatchSize := 100
+	numMessagesPerConsume := 199
+	totalMessages := runtime.NumCPU() * numMessagesPerConsume
+
+	testMessages := generateMessages(totalMessages)
+
+	actualMessages := make([][]testLogMessage, totalMessages/numMessagesPerConsume)
+	for i := range actualMessages {
+		actualMessages[i] = make([]testLogMessage, numMessagesPerConsume)
+	}
+	for i := range testMessages {
+		actualMessages[i/numMessagesPerConsume][i%numMessagesPerConsume] = testMessages[i].actual
+	}
+
+	tln := new(consumertest.LogsSink)
+	factory := NewFactory()
+	ltp, err := factory.CreateLogsProcessor(context.Background(), componenttest.NewNopProcessorCreateSettings(), cfg, tln)
+	require.NoError(t, err)
+	assert.True(t, ltp.Capabilities().MutatesData)
+
+	err = ltp.Start(context.Background(), nil)
+	require.NoError(t, err)
+
+	wg := sync.WaitGroup{}
+	for i := range actualMessages {
+		wg.Add(1)
+		logMessages := actualMessages[i]
+		fmt.Printf("%d: Writing %d messages\n", i, len(logMessages))
+		go func() {
+			err = ltp.ConsumeLogs(context.Background(), generateLogData(logMessages))
+			require.NoError(t, err)
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+	expectedMessages := runtime.NumCPU() * maxEmitterBatchSize
+	require.Equal(t, expectedMessages, tln.LogRecordCount())
+	// there should still be runtime.NumCPU() * 99 messages pending to be flushed
+	for i := 0; i < runtime.NumCPU(); i++ {
+		err = ltp.ConsumeLogs(context.Background(), plog.NewLogs())
+		require.NoError(t, err)
+		if i == runtime.NumCPU()-1 {
+			// on the last iteration, all the remaining messages will be "flushed"
+			expectedMessages += totalMessages - expectedMessages
+		} else {
+			// on every other iteration, each consume will just retrieve one of the pending batches
+			expectedMessages += maxEmitterBatchSize
+		}
+		require.Equal(t, expectedMessages, tln.LogRecordCount())
+	}
+
+	require.Equal(t, totalMessages, tln.LogRecordCount())
 }
 
 func TestLogsTransformProcessor(t *testing.T) {
