@@ -78,7 +78,5 @@ func createLogsProcessor(
 		cfg,
 		nextConsumer,
 		proc.processLogs,
-		processorhelper.WithStart(proc.Start),
-		processorhelper.WithShutdown(proc.Shutdown),
 		processorhelper.WithCapabilities(processorCapabilities))
 }
